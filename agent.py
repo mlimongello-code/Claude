@@ -3,11 +3,18 @@ Prenotami Appointment Scheduler Agent
 ======================================
 Automates appointment booking on https://prenotami.esteri.it
 
-Appointments are released daily at 6pm EST. This agent:
-  1. Wakes up before the release window
-  2. Logs in and polls for available slots aggressively
-  3. Books the first available appointment
-  4. Retries transparently on 503 / overload errors
+The site releases a limited number of slots daily around 6pm EST.
+This agent:
+  1. Logs in (with reCAPTCHA handling)
+  2. Navigates to the specified service booking page
+  3. Polls aggressively for available calendar slots
+  4. Books the first available slot
+  5. Retries transparently on 503 / server overload errors
+
+reCAPTCHA handling (in priority order):
+  A. 2captcha service  — set "two_captcha_api_key" in config.json
+  B. Automatic bypass   — realistic browser profile sometimes passes v2 automatically
+  C. Manual            — set "headless": false, solve it yourself in the browser window
 """
 
 import json
@@ -15,12 +22,12 @@ import logging
 import os
 import sys
 import time
-import datetime
-import zoneinfo
+import urllib.parse
+import urllib.request
 from pathlib import Path
 from typing import Optional
 
-from playwright.sync_api import sync_playwright, Page, Browser, TimeoutError as PlaywrightTimeout
+from playwright.sync_api import sync_playwright, Page, BrowserContext, TimeoutError as PlaywrightTimeout
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -35,9 +42,9 @@ logging.basicConfig(
 )
 log = logging.getLogger("prenotami")
 
-BASE_URL = "https://prenotami.esteri.it"
-LOGIN_URL = f"{BASE_URL}/Home"
-BOOKING_URL = f"{BASE_URL}/Services"
+BASE_URL      = "https://prenotami.esteri.it"
+LOGIN_URL     = f"{BASE_URL}/Home"
+SERVICES_URL  = f"{BASE_URL}/Services"
 
 
 # ---------------------------------------------------------------------------
@@ -47,26 +54,18 @@ BOOKING_URL = f"{BASE_URL}/Services"
 def load_config(path: str = "config.json") -> dict:
     cfg_path = Path(path)
     if not cfg_path.exists():
-        example = Path("config.example.json")
-        if example.exists():
-            log.error(
-                "config.json not found. Copy config.example.json to config.json "
-                "and fill in your credentials."
-            )
-        else:
-            log.error("config.json not found.")
+        log.error("config.json not found. Copy config.example.json → config.json and fill in your details.")
         sys.exit(1)
 
     with open(cfg_path, encoding="utf-8") as f:
         cfg = json.load(f)
 
-    required = ["email", "password"]
-    for key in required:
+    for key in ("email", "password", "service_id"):
         if not cfg.get(key):
-            log.error("Missing required config key: %s", key)
+            log.error("Missing required config key: '%s'", key)
             sys.exit(1)
 
-    # Apply defaults
+    cfg.setdefault("two_captcha_api_key", None)
     cfg.setdefault("max_retries_on_503", 300)
     cfg.setdefault("poll_interval_seconds", 3)
     cfg.setdefault("ramp_up_minutes_before", 10)
@@ -74,43 +73,44 @@ def load_config(path: str = "config.json") -> dict:
     cfg.setdefault("daily_release_hour", 18)
     cfg.setdefault("daily_release_minute", 0)
     cfg.setdefault("headless", True)
+    cfg.setdefault("notify_webhook", None)
     return cfg
 
 
 # ---------------------------------------------------------------------------
-# Notification helpers
+# Notification
 # ---------------------------------------------------------------------------
 
 def notify(cfg: dict, subject: str, body: str) -> None:
-    """Send notification via webhook if configured."""
     webhook = cfg.get("notify_webhook")
-    if webhook:
-        try:
-            import urllib.request, urllib.parse
-            payload = json.dumps({"text": f"*{subject}*\n{body}"}).encode()
-            req = urllib.request.Request(
-                webhook,
-                data=payload,
-                headers={"Content-Type": "application/json"},
-                method="POST",
-            )
-            urllib.request.urlopen(req, timeout=10)
-            log.info("Webhook notification sent.")
-        except Exception as exc:
-            log.warning("Failed to send webhook notification: %s", exc)
+    if not webhook:
+        return
+    try:
+        payload = json.dumps({"text": f"*{subject}*\n{body}"}).encode()
+        req = urllib.request.Request(
+            webhook, data=payload,
+            headers={"Content-Type": "application/json"}, method="POST",
+        )
+        urllib.request.urlopen(req, timeout=10)
+        log.info("Webhook notification sent.")
+    except Exception as exc:
+        log.warning("Webhook failed: %s", exc)
 
 
 # ---------------------------------------------------------------------------
-# Browser helpers
+# Browser setup
 # ---------------------------------------------------------------------------
 
 def launch_browser(playwright, cfg: dict):
+    """Launch Chromium with human-like fingerprinting to help pass reCAPTCHA."""
     browser = playwright.chromium.launch(
         headless=cfg["headless"],
         args=[
             "--no-sandbox",
             "--disable-dev-shm-usage",
             "--disable-blink-features=AutomationControlled",
+            "--disable-infobars",
+            "--window-size=1366,768",
         ],
     )
     context = browser.new_context(
@@ -119,42 +119,184 @@ def launch_browser(playwright, cfg: dict):
             "AppleWebKit/537.36 (KHTML, like Gecko) "
             "Chrome/120.0.0.0 Safari/537.36"
         ),
+        viewport={"width": 1366, "height": 768},
         locale="it-IT",
         timezone_id="America/New_York",
+        java_script_enabled=True,
     )
-    # Hide webdriver flag
-    context.add_init_script(
-        "Object.defineProperty(navigator, 'webdriver', {get: () => undefined})"
-    )
+    # Remove navigator.webdriver fingerprint
+    context.add_init_script("""
+        Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+        Object.defineProperty(navigator, 'plugins', { get: () => [1,2,3,4,5] });
+        Object.defineProperty(navigator, 'languages', { get: () => ['it-IT','it','en-US','en'] });
+        window.chrome = { runtime: {} };
+    """)
     return browser, context
 
 
-def is_503(page: Page) -> bool:
-    """Detect 503 / overload pages."""
+# ---------------------------------------------------------------------------
+# reCAPTCHA helpers
+# ---------------------------------------------------------------------------
+
+def _get_recaptcha_sitekey(page: Page) -> Optional[str]:
+    """Extract the reCAPTCHA sitekey from the page."""
     try:
-        content = page.content().lower()
-        title = page.title().lower()
-        url = page.url.lower()
-        indicators = [
-            "503",
-            "service unavailable",
-            "server error",
-            "too many requests",
-            "429",
-            "overloaded",
-            "temporarily unavailable",
-        ]
-        return any(ind in content or ind in title or ind in url for ind in indicators)
+        sitekey = page.get_attribute("[data-sitekey]", "data-sitekey", timeout=3000)
+        return sitekey
     except Exception:
+        pass
+    try:
+        sitekey = page.evaluate(
+            "() => { const el = document.querySelector('.g-recaptcha'); "
+            "return el ? el.dataset.sitekey : null; }"
+        )
+        return sitekey
+    except Exception:
+        return None
+
+
+def solve_recaptcha_2captcha(page: Page, api_key: str) -> bool:
+    """
+    Use 2captcha.com to solve the reCAPTCHA v2.
+    Returns True if solved and injected successfully.
+    API key: https://2captcha.com (a few cents per solve)
+    """
+    sitekey = _get_recaptcha_sitekey(page)
+    if not sitekey:
+        log.warning("Could not find reCAPTCHA sitekey on page.")
+        return False
+
+    log.info("Sending reCAPTCHA to 2captcha (sitekey: %s)…", sitekey)
+    page_url = page.url
+
+    # Submit task
+    try:
+        submit_url = (
+            "http://2captcha.com/in.php?"
+            + urllib.parse.urlencode({
+                "key": api_key,
+                "method": "userrecaptcha",
+                "googlekey": sitekey,
+                "pageurl": page_url,
+                "json": 1,
+            })
+        )
+        with urllib.request.urlopen(submit_url, timeout=30) as r:
+            result = json.loads(r.read())
+        if result.get("status") != 1:
+            log.warning("2captcha submit failed: %s", result)
+            return False
+        task_id = result["request"]
+        log.info("2captcha task submitted, id=%s. Waiting for solve…", task_id)
+    except Exception as exc:
+        log.warning("2captcha submit error: %s", exc)
+        return False
+
+    # Poll for result (up to 120 seconds)
+    for attempt in range(24):
+        time.sleep(5)
+        try:
+            poll_url = (
+                "http://2captcha.com/res.php?"
+                + urllib.parse.urlencode({
+                    "key": api_key,
+                    "action": "get",
+                    "id": task_id,
+                    "json": 1,
+                })
+            )
+            with urllib.request.urlopen(poll_url, timeout=15) as r:
+                result = json.loads(r.read())
+            if result.get("status") == 1:
+                token = result["request"]
+                log.info("2captcha solved! Injecting token…")
+                break
+            if result.get("request") == "ERROR_CAPTCHA_UNSOLVABLE":
+                log.warning("2captcha: CAPTCHA unsolvable.")
+                return False
+        except Exception as exc:
+            log.warning("2captcha poll error: %s", exc)
+    else:
+        log.warning("2captcha timed out waiting for solution.")
+        return False
+
+    # Inject the token into the page
+    try:
+        page.evaluate(
+            f"""() => {{
+                document.getElementById('g-recaptcha-response').innerHTML = '{token}';
+                if (typeof ___grecaptcha_cfg !== 'undefined') {{
+                    Object.entries(___grecaptcha_cfg.clients).forEach(([k, v]) => {{
+                        if (v && v.S && typeof v.S.callback === 'function') {{
+                            v.S.callback('{token}');
+                        }}
+                    }});
+                }}
+            }}"""
+        )
+        log.info("reCAPTCHA token injected.")
+        return True
+    except Exception as exc:
+        log.warning("Token injection error: %s", exc)
         return False
 
 
-def wait_for_stable_page(page: Page, timeout: int = 30_000) -> None:
-    """Wait until the page network is idle."""
+def handle_recaptcha(page: Page, cfg: dict) -> None:
+    """
+    Attempt to handle reCAPTCHA via 2captcha if key is configured.
+    If not configured, log a warning and rely on automatic pass or manual solve.
+    """
+    api_key = cfg.get("two_captcha_api_key")
+    if api_key:
+        solved = solve_recaptcha_2captcha(page, api_key)
+        if not solved:
+            log.warning("2captcha solve failed — attempting submit anyway.")
+    else:
+        if cfg["headless"]:
+            log.warning(
+                "No 2captcha key configured and headless=true. "
+                "Login may fail due to reCAPTCHA. "
+                "Consider setting two_captcha_api_key or headless=false."
+            )
+        else:
+            log.info("headless=false: please solve the reCAPTCHA manually in the browser window, then press Enter here.")
+            input("Press Enter after solving the reCAPTCHA in the browser…")
+
+
+# ---------------------------------------------------------------------------
+# Page helpers
+# ---------------------------------------------------------------------------
+
+def is_503(page: Page) -> bool:
+    try:
+        content = page.content().lower()
+        title   = page.title().lower()
+        url     = page.url.lower()
+        for indicator in ["503", "service unavailable", "too many requests",
+                          "429", "temporarily unavailable", "server error"]:
+            if indicator in content or indicator in title or indicator in url:
+                return True
+    except Exception:
+        pass
+    return False
+
+
+def wait_for_page(page: Page, timeout: int = 20_000) -> None:
     try:
         page.wait_for_load_state("networkidle", timeout=timeout)
     except PlaywrightTimeout:
-        pass  # Proceed anyway; some pages never fully idle
+        pass
+
+
+def is_logged_in(page: Page) -> bool:
+    """Check if we still have an authenticated session."""
+    url = page.url.lower()
+    # Redirected to login page = not logged in
+    if "login" in url or (url.endswith("/home") and "services" not in url):
+        content = page.content().lower()
+        if "login-email" in content or "login-password" in content:
+            return False
+    return True
 
 
 # ---------------------------------------------------------------------------
@@ -163,208 +305,262 @@ def wait_for_stable_page(page: Page, timeout: int = 30_000) -> None:
 
 def login(page: Page, cfg: dict) -> bool:
     """
-    Log in to Prenotami. Returns True on success, False otherwise.
+    Navigate to login page and authenticate.
+    Handles reCAPTCHA via 2captcha or manual solve.
+    Returns True on success.
     """
-    log.info("Navigating to login page…")
+    log.info("Loading login page…")
     try:
         page.goto(LOGIN_URL, wait_until="domcontentloaded", timeout=30_000)
-        wait_for_stable_page(page)
+        wait_for_page(page)
     except Exception as exc:
-        log.warning("Navigation error on login page: %s", exc)
+        log.warning("Failed to load login page: %s", exc)
         return False
 
     if is_503(page):
         log.warning("503 on login page.")
         return False
 
+    # Accept cookie consent if shown
     try:
-        # Accept cookie banner if present
-        cookie_btn = page.locator("button:has-text('Accetto'), button:has-text('Accept'), #cookieAccept")
+        cookie_btn = page.locator("#cookieAccept, button:has-text('Accetto'), button:has-text('Accept All')")
         if cookie_btn.count() > 0:
             cookie_btn.first.click()
             time.sleep(0.5)
+    except Exception:
+        pass
 
-        # Fill credentials
-        email_field = page.locator("input[type='email'], input[name='Email'], #Email")
-        password_field = page.locator("input[type='password'], input[name='Password'], #Password")
-
-        email_field.first.fill(cfg["email"])
-        password_field.first.fill(cfg["password"])
-
-        # Submit
-        submit = page.locator("button[type='submit'], input[type='submit']")
-        submit.first.click()
-        wait_for_stable_page(page)
-
-        # Check for failed login indicators
-        current = page.url.lower()
-        content = page.content().lower()
-        failure_signals = ["invalid", "incorrect", "errore", "error", "wrong"]
-        if any(s in content for s in failure_signals) and "home" not in current and "service" not in current:
-            log.error("Login failed — check your credentials.")
-            return False
-
-        log.info("Login successful. Current URL: %s", page.url)
-        return True
-
-    except Exception as exc:
-        log.warning("Exception during login: %s", exc)
+    # Wait for email field
+    try:
+        page.wait_for_selector("#login-email", timeout=15_000)
+    except PlaywrightTimeout:
+        log.warning("Login form not found (login-email missing). Page: %s", page.url)
         return False
 
+    log.info("Filling credentials…")
+    page.fill("#login-email", cfg["email"])
+    time.sleep(0.3)
+    page.fill("#login-password", cfg["password"])
+    time.sleep(0.5)
 
-# ---------------------------------------------------------------------------
-# Navigate to booking service
-# ---------------------------------------------------------------------------
+    # Handle reCAPTCHA before submitting
+    handle_recaptcha(page, cfg)
 
-def navigate_to_service(page: Page, cfg: dict) -> bool:
-    """
-    Navigate to the booking/services page after login.
-    If service_id is set in config, navigate directly to that service.
-    """
-    service_id = cfg.get("service_id")
-    if service_id:
-        target = f"{BASE_URL}/Services/Booking/{service_id}"
-    else:
-        target = BOOKING_URL
-
-    log.info("Navigating to services: %s", target)
+    # Click the login button (has class 'g-recaptcha' because it triggers captcha callback)
+    log.info("Submitting login form…")
     try:
-        page.goto(target, wait_until="domcontentloaded", timeout=30_000)
-        wait_for_stable_page(page)
+        submit = page.locator("button.g-recaptcha, button[type='submit'], input[type='submit']")
+        submit.first.click()
+        wait_for_page(page)
     except Exception as exc:
-        log.warning("Navigation error to services: %s", exc)
+        log.warning("Submit click error: %s", exc)
+        return False
+
+    # Verify login success
+    url     = page.url.lower()
+    content = page.content().lower()
+
+    failure_signals = ["login-email", "login-password", "credenziali errate",
+                       "invalid credentials", "errore di autenticazione"]
+    if any(s in content for s in failure_signals):
+        log.error("Login failed — wrong credentials or reCAPTCHA blocked.")
+        page.screenshot(path="login_failed.png")
+        return False
+
+    log.info("Login successful. URL: %s", page.url)
+    return True
+
+
+# ---------------------------------------------------------------------------
+# Navigate to booking page
+# ---------------------------------------------------------------------------
+
+def go_to_booking_page(page: Page, cfg: dict) -> bool:
+    """
+    Navigate directly to the service booking page:
+    https://prenotami.esteri.it/Services/Booking/{service_id}
+    """
+    service_id = cfg["service_id"]
+    url = f"{BASE_URL}/Services/Booking/{service_id}"
+    log.info("Navigating to booking page: %s", url)
+
+    try:
+        page.goto(url, wait_until="domcontentloaded", timeout=30_000)
+        wait_for_page(page)
+    except Exception as exc:
+        log.warning("Navigation error: %s", exc)
         return False
 
     if is_503(page):
-        log.warning("503 on services page.")
+        log.warning("503 on booking page.")
+        return False
+
+    # If we got redirected to login, session expired
+    if not is_logged_in(page):
+        log.warning("Redirected to login — session expired.")
         return False
 
     return True
 
 
 # ---------------------------------------------------------------------------
-# Check for available slots
+# Appointment type selection
 # ---------------------------------------------------------------------------
 
-def check_and_book(page: Page, cfg: dict) -> bool:
+def select_appointment_type(page: Page, cfg: dict) -> bool:
     """
-    Scan the booking calendar for available slots and book the first one.
-    Returns True if appointment was successfully booked.
+    If the booking page shows a list of appointment types/services, select the
+    correct one. If appointment_type_text is configured, match by text;
+    otherwise pick the first option.
     """
-    content = page.content()
+    apt_text = cfg.get("appointment_type_text", "").strip().lower()
 
-    # Detect "no availability" messages (Italian + English)
-    no_avail_phrases = [
+    # Check if there's a selection step (list of services/types)
+    # Common patterns: <a> cards, <button>, <li> items, <select> dropdown
+    type_links = page.locator(
+        "a.service-type, a.appointment-type, "
+        ".service-list a, .list-group-item, "
+        "table.services td a, .table-services a"
+    )
+
+    if type_links.count() == 0:
+        # Maybe it's a direct booking form — no selection needed
+        log.info("No appointment type selection found — proceeding directly.")
+        return True
+
+    log.info("Found %d appointment type option(s).", type_links.count())
+
+    if apt_text:
+        for i in range(type_links.count()):
+            link = type_links.nth(i)
+            if apt_text in link.inner_text().lower():
+                log.info("Selecting appointment type: %s", link.inner_text().strip())
+                link.click()
+                wait_for_page(page)
+                return True
+        log.warning("Could not find appointment type matching '%s'. Selecting first.", apt_text)
+
+    type_links.first.click()
+    wait_for_page(page)
+    return True
+
+
+# ---------------------------------------------------------------------------
+# Calendar — detect and book available slot
+# ---------------------------------------------------------------------------
+
+def find_and_book_slot(page: Page) -> bool:
+    """
+    Look for available (green) calendar slots and book the first one.
+    Prenotami uses a Bootstrap datepicker-style calendar where:
+      - Available days: <td class="day"> without 'disabled' or 'old'
+      - Green highlight or custom class signals availability
+    Returns True if an appointment was booked.
+    """
+    # Check for no-availability messages first
+    no_avail = [
         "non ci sono appuntamenti disponibili",
         "no appointments available",
         "nessuna disponibilità",
-        "no availability",
         "fully booked",
-        "esauriti",
     ]
-    content_lower = content.lower()
-    if any(p in content_lower for p in no_avail_phrases):
-        log.info("No appointments available yet.")
+    content_lower = page.content().lower()
+    if any(p in content_lower for p in no_avail):
+        log.info("No appointments available (explicit message).")
         return False
 
-    # Look for clickable calendar dates / time slots
-    # Prenotami uses a table-based calendar; available days are clickable <td> or <a> elements
-    available_slots = page.locator(
-        "td.day:not(.disabled):not(.old):not(.new), "
-        "td.available, "
-        "a.available-slot, "
-        "td[class*='available'], "
-        "button.available, "
-        ".fc-day:not(.fc-day-disabled)"
+    # Available calendar cells — green/active days
+    # The site uses Bootstrap datepicker; available = .day without .disabled/.old/.new
+    # Some versions use a custom 'active' or colored class for open slots
+    available = page.locator(
+        # Bootstrap datepicker available days
+        "td.day:not(.disabled):not(.old):not(.new):not(.off), "
+        # FullCalendar / custom calendar available event
+        "td.open-day, td.available, .fc-event.available, "
+        # Colored table cells (green background inline or class)
+        "td[style*='green'], td.green, td.slot-available, "
+        # Any day cell with a booking link inside
+        "td.day > a"
     )
 
-    count = available_slots.count()
-    log.info("Found %d potential available slot(s).", count)
-
+    count = available.count()
     if count == 0:
+        log.info("No available slot cells found in calendar.")
         return False
 
-    # Click the first available slot
-    log.info("Clicking first available slot…")
-    available_slots.first.click()
-    wait_for_stable_page(page)
+    log.info("Found %d available slot(s). Clicking the first…", count)
+    available.first.click()
+    wait_for_page(page)
 
-    # Look for a time-slot picker or confirmation button
-    time_options = page.locator(
-        "input[type='radio'], "
-        "button.time-slot, "
-        ".orario, "
-        "td.slot, "
-        "li.slot-time"
+    # After clicking a day, a time-slot list may appear
+    time_slots = page.locator(
+        "input[type='radio'], "           # radio buttons for times
+        "button.orario, .orario, "        # Italian "time" class
+        "button.time-slot, a.time-slot, " # generic time slot
+        "li.slot, td.slot-time"
     )
-    if time_options.count() > 0:
-        log.info("Selecting first available time…")
-        time_options.first.click()
-        wait_for_stable_page(page)
+    if time_slots.count() > 0:
+        log.info("Selecting first time slot…")
+        time_slots.first.click()
+        wait_for_page(page)
 
-    # Fill any required notes / remarks field
-    notes_field = page.locator("textarea[name='Notes'], textarea[name='note'], #Notes")
+    # Fill optional notes
+    notes_field = page.locator("#Notes, textarea[name='Notes'], textarea[name='note']")
     if notes_field.count() > 0:
-        notes_field.first.fill("Appointment booking via automated scheduler.")
+        notes_field.first.fill("Automated booking")
 
-    # Confirm / submit
-    confirm_btn = page.locator(
+    # Confirm the booking
+    confirm = page.locator(
         "button:has-text('Prenota'), "
-        "button:has-text('Confirm'), "
         "button:has-text('Conferma'), "
-        "input[type='submit'], "
-        "button[type='submit']"
+        "button:has-text('Confirm'), "
+        "button:has-text('Book'), "
+        "input[type='submit']"
     )
-    if confirm_btn.count() > 0:
-        log.info("Submitting booking confirmation…")
-        confirm_btn.first.click()
-        wait_for_stable_page(page)
-    else:
-        log.warning("No confirmation button found. Manual review may be needed.")
+    if confirm.count() == 0:
+        log.warning("No confirmation button found — saving screenshot.")
         page.screenshot(path="booking_state.png")
         return False
 
-    # Verify booking success
-    final_content = page.content().lower()
-    success_phrases = [
-        "appuntamento confermato",
-        "booking confirmed",
-        "prenotazione effettuata",
-        "successfully booked",
-        "confirmation",
-        "conferma",
-        "ricevuta",
+    log.info("Clicking confirmation button…")
+    confirm.first.click()
+    wait_for_page(page)
+
+    # Check success
+    final = page.content().lower()
+    success = [
+        "appuntamento confermato", "booking confirmed",
+        "prenotazione effettuata", "successfully booked",
+        "conferma", "ricevuta", "receipt",
     ]
-    if any(p in final_content for p in success_phrases):
+    if any(p in final for p in success):
         log.info("APPOINTMENT BOOKED SUCCESSFULLY!")
         page.screenshot(path="booking_confirmed.png")
         return True
 
-    # Check if we ended up on an unexpected page
     if is_503(page):
         log.warning("503 after booking attempt.")
         return False
 
-    # Ambiguous — save screenshot for review
-    log.warning("Booking outcome unclear. Saving screenshot for review.")
+    log.warning("Booking outcome unclear — saving screenshot.")
     page.screenshot(path="booking_state.png")
     return False
 
 
 # ---------------------------------------------------------------------------
-# Core retry polling loop
+# Core polling loop
 # ---------------------------------------------------------------------------
 
 def poll_until_booked(cfg: dict) -> bool:
     """
-    Spin up a browser session and aggressively poll for an appointment.
-    Handles 503s by reloading; re-logs in if session expires.
-    Returns True if an appointment was booked.
+    Main loop: login → navigate → poll calendar → book.
+    Handles 503s and session expiry automatically.
+    Returns True if an appointment was secured.
     """
-    max_503_retries = cfg["max_503_retries_on_503"] if "max_503_retries_on_503" in cfg else cfg["max_retries_on_503"]
-    poll_interval = cfg["poll_interval_seconds"]
-    retry_503 = 0
-    attempt = 0
+    max_503_retries  = cfg["max_retries_on_503"]
+    poll_interval    = cfg["poll_interval_seconds"]
+    consecutive_503s = 0
+    attempt          = 0
 
     with sync_playwright() as pw:
         browser, context = launch_browser(pw, cfg)
@@ -372,81 +568,86 @@ def poll_until_booked(cfg: dict) -> bool:
 
         try:
             # Initial login
-            logged_in = False
-            for _ in range(5):
+            for attempt_login in range(1, 6):
                 if login(page, cfg):
-                    logged_in = True
                     break
-                log.warning("Login attempt failed, retrying in 5s…")
-                time.sleep(5)
-
-            if not logged_in:
-                log.error("Could not log in after multiple attempts. Aborting.")
+                log.warning("Login attempt %d failed. Retrying in 10s…", attempt_login)
+                time.sleep(10)
+            else:
+                log.error("Could not log in after 5 attempts. Aborting.")
                 return False
 
-            if not navigate_to_service(page, cfg):
-                log.warning("Could not navigate to service page initially.")
+            # Navigate to the booking page
+            if not go_to_booking_page(page, cfg):
+                log.warning("Failed to reach booking page after login.")
 
-            while retry_503 < max_503_retries:
+            # Select appointment type if needed
+            select_appointment_type(page, cfg)
+
+            # Polling loop
+            while consecutive_503s < max_503_retries:
                 attempt += 1
-                log.info("Poll attempt #%d (503 retries: %d/%d)…", attempt, retry_503, max_503_retries)
+                log.info("Poll #%d (503 streak: %d)…", attempt, consecutive_503s)
 
-                # Reload the booking page to get fresh data
+                # Reload booking page to get fresh calendar
                 try:
                     page.reload(wait_until="domcontentloaded", timeout=20_000)
-                    wait_for_stable_page(page, timeout=10_000)
+                    wait_for_page(page, timeout=10_000)
                 except Exception as exc:
                     log.warning("Reload error: %s", exc)
 
-                # Detect 503
+                # Handle 503
                 if is_503(page):
-                    retry_503 += 1
-                    log.warning("503 detected (%d/%d). Waiting %ds before retry…",
-                                retry_503, max_503_retries, poll_interval)
+                    consecutive_503s += 1
+                    log.warning("503 (#%d). Waiting %ds…", consecutive_503s, poll_interval)
                     time.sleep(poll_interval)
                     continue
 
-                # Detect logged-out state and re-login
-                if "login" in page.url.lower() or "home" in page.url.lower():
-                    log.info("Session expired, re-logging in…")
-                    if not login(page, cfg):
-                        log.warning("Re-login failed. Retrying…")
+                consecutive_503s = 0  # Reset on a clean page load
+
+                # Re-login if session expired
+                if not is_logged_in(page):
+                    log.info("Session expired — re-logging in…")
+                    for _ in range(3):
+                        if login(page, cfg):
+                            go_to_booking_page(page, cfg)
+                            select_appointment_type(page, cfg)
+                            break
                         time.sleep(5)
-                        retry_503 += 1
-                        continue
-                    navigate_to_service(page, cfg)
+                    else:
+                        log.warning("Could not re-establish session.")
+                        consecutive_503s += 1
+                    continue
 
                 # Try to book
-                retry_503 = 0  # Reset 503 counter on successful page load
-                if check_and_book(page, cfg):
+                if find_and_book_slot(page):
                     return True
 
-                log.info("No slot grabbed. Waiting %ds before next poll…", poll_interval)
+                log.info("No slot yet. Waiting %ds…", poll_interval)
                 time.sleep(poll_interval)
 
-            log.error("Exceeded maximum 503 retries. Giving up.")
+            log.error("Exceeded max 503 retries (%d). Stopping.", max_503_retries)
             return False
 
         finally:
             try:
+                context.close()
                 browser.close()
             except Exception:
                 pass
 
 
 # ---------------------------------------------------------------------------
-# Entry point (direct run — skips time gating)
+# Entry point (run immediately, no time gate)
 # ---------------------------------------------------------------------------
 
 def run_now(cfg: dict) -> None:
-    log.info("Starting appointment polling NOW (no time gate).")
+    log.info("Starting appointment polling immediately.")
     booked = poll_until_booked(cfg)
     if booked:
-        notify(cfg, "Appointment Booked!", "Your appointment on prenotami.esteri.it has been confirmed!")
-        log.info("Done — appointment secured.")
+        notify(cfg, "Appointment Booked!", "Your prenotami.esteri.it appointment has been confirmed!")
     else:
-        notify(cfg, "Appointment NOT Booked", "The scheduler finished without securing an appointment.")
-        log.warning("Done — no appointment was secured.")
+        notify(cfg, "No Appointment Secured", "The scheduler finished without booking an appointment.")
 
 
 if __name__ == "__main__":
