@@ -3,8 +3,25 @@
 Automated agent that books appointments on [prenotami.esteri.it](https://prenotami.esteri.it).
 
 Appointments are released daily around **6:00 PM EST**. This agent wakes up before the
-window, logs in, and polls aggressively — retrying through 503 errors — until a slot
-is secured.
+window, logs in, navigates through the full booking flow, and polls aggressively —
+retrying through 503 errors — until a slot is secured.
+
+---
+
+## Full booking flow (what the agent does)
+
+```
+1.  Login              → /Home  (#login-email, #login-password, reCAPTCHA)
+2.  Navigate           → /Services/Booking/{service_id}
+3.  Dismiss dialog     → "no appointments available" popup (if shown)
+4.  Fill service form  → dropdowns, text fields, file uploads, privacy checkbox
+5.  Click "Avanti"     → (#btnAvanti) — lands on calendar
+6.  Poll calendar      → every 3s, reload and look for green (available) days
+7.  Click green day    → select first available time slot
+8.  Submit             → site sends OTP to your email
+9.  Enter OTP          → via IMAP auto-retrieval or manual terminal input
+10. Confirmed!         → screenshot saved, webhook sent
+```
 
 ---
 
@@ -25,95 +42,129 @@ python3 -m playwright install chromium
 cp config.example.json config.json
 ```
 
-Edit `config.json`:
+### 2. Set your credentials
 
 ```json
 {
   "email": "your.email@example.com",
   "password": "your_password",
-  "service_id": 1090,
-  "appointment_type_text": "",
-  "two_captcha_api_key": null,
-  "headless": true
+  "service_id": 1319
 }
 ```
 
-### 2. Find your `service_id`
+### 3. Find your `service_id`
 
-This is the most important setting.
+| Service | URL | ID |
+|---|---|---|
+| Passport | `/Services/Booking/1319` | `1319` |
+| Citizenship | `/Services/Booking/2392` | `2392` |
+| Other | Log in → Book tab → your service → check URL | varies |
 
-1. Log in manually to prenotami.esteri.it
-2. Click the **Book** tab in the navigation
-3. Select your appointment category (e.g. Citizenship, Passport, Visa)
-4. Look at the URL — it will be something like:
-   ```
-   https://prenotami.esteri.it/Services/Booking/1090
-   ```
-5. Copy that number (`1090`) into `service_id` in config.json
+Navigate to your service manually, copy the number at the end of the URL.
 
-### 3. Handle reCAPTCHA
+### 4. Configure reCAPTCHA (login is gated by Google reCAPTCHA v2)
 
-The login form has a **reCAPTCHA** which is the main obstacle. You have three options:
-
-#### Option A — 2captcha service (recommended for headless/server use)
-Sign up at [2captcha.com](https://2captcha.com) (~$3 per 1000 solves).
+**Option A — 2captcha (recommended for unattended/headless use)**
 ```json
-"two_captcha_api_key": "your_2captcha_api_key_here"
+"two_captcha_api_key": "your_api_key_here"
 ```
+Sign up at [2captcha.com](https://2captcha.com). Costs ~$3 per 1000 solves.
 
-#### Option B — Manual solve (no cost, requires you to be present)
+**Option B — Manual (you solve it once)**
 ```json
 "headless": false
 ```
-The browser window will open. When it reaches the login page, solve the CAPTCHA yourself
-and press **Enter** in the terminal. The agent takes over from there.
+Browser window opens at login. Solve the CAPTCHA yourself, press **Enter** in terminal.
 
-#### Option C — Automatic (may work, may not)
-Leave `two_captcha_api_key` as `null` and `headless` as `true`. Playwright with a
-human-like browser profile sometimes passes reCAPTCHA v2 automatically. Worth trying
-first — if login keeps failing, switch to Option A or B.
+**Option C — Automatic (may or may not work)**
+Leave both unset. The agent uses a human-like browser profile that sometimes auto-passes
+reCAPTCHA v2. Try it first; if login always fails, switch to A or B.
+
+### 5. Fill in service form fields
+
+Before the calendar appears, the site shows a service-specific form. Set the answers
+in `form_fields` — these map directly to HTML element IDs on the page:
+
+```json
+"form_fields": {
+  "ddls_0": "Si",
+  "ddls_1": "No",
+  "ddls_4": "Celibe/Nubile",
+  "DatiAddizionaliPrenotante_2___testo": "0",
+  "DatiAddizionaliPrenotante_3___testo": "123 Main St, New York NY"
+}
+```
+
+**Passport form fields (`service_id: 1319`):**
+
+| Field ID | Description | Example values |
+|---|---|---|
+| `ddls_0` | Do you have an expired passport? | `"Si"`, `"No"` |
+| `ddls_1` | Second passport question | `"Si"`, `"No"` |
+| `ddls_4` | Marital status | `"Celibe/Nubile"`, `"Coniugato/a"`, `"Divorziato/a"`, `"Vedovo/a"` |
+| `DatiAddizionaliPrenotante_2___testo` | Number of children | `"0"`, `"1"`, `"2"` |
+| `DatiAddizionaliPrenotante_3___testo` | Full address | your address |
+
+**Citizenship form (`service_id: 2392`):**
+Only requires file uploads — no `form_fields` needed.
+
+**File uploads:**
+```json
+"file_uploads": {
+  "File_0": "/home/user/docs/identity.pdf",
+  "File_1": "/home/user/docs/residence.pdf"
+}
+```
+
+| Field ID | Document |
+|---|---|
+| `File_0` | Identity document (passport, ID card) |
+| `File_1` | Proof of residence |
+
+> **Tip:** Run with `"headless": false` the first time to watch the form being filled
+> and confirm the values are correct.
+
+### 6. Configure OTP handling
+
+After selecting a calendar slot, the site emails you a one-time code and shows a popup.
+
+**Option A — IMAP auto-retrieve (unattended)**
+```json
+"imap_host": "imap.gmail.com",
+"imap_user": "your.email@gmail.com",
+"imap_password": "your_app_password",
+"otp_delay_seconds": 30
+```
+The agent waits `otp_delay_seconds` for the email to arrive, then fetches it via IMAP.
+For Gmail, use an [App Password](https://myaccount.google.com/apppasswords), not your
+account password.
+
+**Option B — Manual**
+Leave all `imap_*` fields as `null`. The agent will print a prompt to the terminal
+and wait for you to type the code. You have ~2 minutes before the session expires.
 
 ---
 
 ## Usage
 
-### Run daily scheduler (recommended)
-```bash
-python3 scheduler.py
-```
-Sleeps until 10 minutes before 6pm EST, then polls until a slot is booked. Repeats
-daily until an appointment is secured.
-
-### Start polling immediately (for testing or if slots are available now)
+### Test your setup (run immediately)
 ```bash
 python3 scheduler.py --now
 # or
 python3 agent.py
 ```
+Skips the time gate and starts polling right away. Good for verifying config.
 
-### Run for exactly one release window, then exit
+### Run the daily scheduler (recommended)
+```bash
+python3 scheduler.py
+```
+Sleeps until 10 minutes before 6pm EST, then polls until a slot is booked.
+Loops every day until an appointment is secured.
+
+### One window only
 ```bash
 python3 scheduler.py --once
-```
-
-### Use a different config file
-```bash
-python3 scheduler.py --config /path/to/my_config.json
-```
-
----
-
-## How it works
-
-```
-6:00 PM EST         Slots released
-5:50 PM EST         Agent wakes up, logs in (with reCAPTCHA)
-5:50–6:00 PM        Navigates to Services/Booking/{service_id}
-6:00 PM →           Reloads page every 3 seconds
-                    On 503: waits 3s and retries (up to 300 times)
-                    On session expiry: re-logs in automatically
-                    On available slot: clicks it → selects time → confirms
-                    On success: saves screenshot, sends webhook notification
 ```
 
 ---
@@ -122,19 +173,25 @@ python3 scheduler.py --config /path/to/my_config.json
 
 | Key | Required | Description |
 |---|---|---|
-| `email` | Yes | Your prenotami.esteri.it account email |
-| `password` | Yes | Your account password |
-| `service_id` | Yes | Numeric ID from the booking URL (e.g. `1090`) |
-| `appointment_type_text` | No | Text to match when selecting an appointment sub-type |
-| `two_captcha_api_key` | No | API key for 2captcha.com reCAPTCHA solving service |
-| `notify_webhook` | No | Slack / Discord webhook URL for success/failure notifications |
-| `headless` | No | `true` = no visible browser (default). `false` = shows browser window |
-| `max_retries_on_503` | No | Max consecutive 503s before giving up (default: 300 ≈ 15 min) |
-| `poll_interval_seconds` | No | Seconds between polls (default: 3) |
-| `ramp_up_minutes_before` | No | How many minutes early to wake up (default: 10) |
-| `daily_release_hour` | No | Release hour in your timezone (default: 18 = 6pm) |
+| `email` | Yes | Prenotami account email |
+| `password` | Yes | Prenotami account password |
+| `service_id` | Yes | Numeric service ID from the booking URL |
+| `two_captcha_api_key` | No | API key for [2captcha.com](https://2captcha.com) |
+| `form_fields` | No | Service form answers keyed by HTML element ID |
+| `file_uploads` | No | File upload paths keyed by HTML element ID |
+| `imap_host` | No | IMAP server for OTP retrieval (e.g. `imap.gmail.com`) |
+| `imap_user` | No | IMAP login email |
+| `imap_password` | No | IMAP password or app password |
+| `otp_delay_seconds` | No | Seconds to wait before checking IMAP (default: 30) |
+| `notify_webhook` | No | Slack/Discord webhook URL |
+| `headless` | No | `true` = no browser window (default). `false` = visible window |
+| `max_retries_on_503` | No | Max 503 retries before giving up (default: 300 ≈ 15 min) |
+| `poll_interval_seconds` | No | Seconds between calendar polls (default: 3) |
+| `max_months_to_check` | No | Months of calendar to scan per poll (default: 3) |
+| `ramp_up_minutes_before` | No | How early to wake up before release time (default: 10) |
+| `daily_release_hour` | No | Release hour in your timezone (default: 18) |
 | `daily_release_minute` | No | Release minute (default: 0) |
-| `timezone` | No | Timezone for release time (default: `America/New_York`) |
+| `timezone` | No | Timezone (default: `America/New_York`) |
 
 ---
 
@@ -143,23 +200,22 @@ python3 scheduler.py --config /path/to/my_config.json
 | File | Description |
 |---|---|
 | `scheduler.log` | Full activity log |
-| `booking_confirmed.png` | Screenshot saved when appointment is successfully booked |
-| `booking_state.png` | Screenshot saved when outcome is unclear (review manually) |
-| `login_failed.png` | Screenshot saved on login failure |
+| `booking_confirmed.png` | Screenshot on successful booking |
+| `booking_state.png` | Screenshot when outcome is unclear |
+| `login_failed.png` | Screenshot on login failure |
+| `form_state.png` | Screenshot if service form couldn't be submitted |
+| `otp_state.png` | Screenshot if OTP step failed |
 
 ---
 
 ## Troubleshooting
 
-**Login keeps failing with headless=true**
-→ Set `"headless": false` to watch the browser, or add a `two_captcha_api_key`.
+**Login fails (headless=true)** → Add `two_captcha_api_key` or set `"headless": false`.
 
-**Agent navigates to wrong page after login**
-→ Find the exact `service_id` from the URL and set it in config.
+**Form fields wrong** → Run with `"headless": false`, watch the form fill, adjust values.
 
-**Booking outcome unclear / `booking_state.png` saved**
-→ The calendar or confirmation flow may have changed. Check the screenshot to see
-   where the agent got stuck and open an issue.
+**OTP expires before entry** → Use IMAP auto-retrieve, or increase `otp_delay_seconds`.
 
-**503 errors persist for more than 15 minutes**
-→ Increase `max_retries_on_503`. The site is very overloaded at release time.
+**503 for 15+ minutes** → Increase `max_retries_on_503`. The site is extremely overloaded at release time.
+
+**Booking outcome unclear** → Check `booking_state.png` to see where the flow stopped.

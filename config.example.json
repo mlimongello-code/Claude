@@ -2,16 +2,34 @@
   "email": "your.email@example.com",
   "password": "your_password",
 
-  "service_id": 1090,
-
-  "appointment_type_text": "",
+  "service_id": 1319,
 
   "two_captcha_api_key": null,
+
+  "form_fields": {
+    "ddls_0": "Si",
+    "ddls_1": "No",
+    "ddls_4": "Celibe/Nubile",
+    "DatiAddizionaliPrenotante_2___testo": "0",
+    "DatiAddizionaliPrenotante_3___testo": "123 Main Street, New York NY"
+  },
+
+  "file_uploads": {
+    "File_0": "/absolute/path/to/identity_document.pdf",
+    "File_1": "/absolute/path/to/proof_of_residence.pdf"
+  },
+
+  "imap_host": null,
+  "imap_user": null,
+  "imap_password": null,
+  "otp_delay_seconds": 30,
 
   "notify_webhook": null,
 
   "max_retries_on_503": 300,
   "poll_interval_seconds": 3,
+  "max_months_to_check": 3,
+
   "ramp_up_minutes_before": 10,
   "timezone": "America/New_York",
   "daily_release_hour": 18,
