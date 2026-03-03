@@ -1,0 +1,15 @@
+{
+  "email": "your.email@example.com",
+  "password": "your_password",
+  "service_id": null,
+  "appointment_type": null,
+  "notify_email": null,
+  "notify_webhook": null,
+  "max_retries_on_503": 300,
+  "poll_interval_seconds": 3,
+  "ramp_up_minutes_before": 10,
+  "timezone": "America/New_York",
+  "daily_release_hour": 18,
+  "daily_release_minute": 0,
+  "headless": true
+}
